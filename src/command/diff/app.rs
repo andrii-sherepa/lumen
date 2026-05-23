@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc::TryRecvError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -31,7 +31,8 @@ use super::types::{
 };
 use super::watcher::{setup_watcher, WatchEvent};
 use super::{
-    fetch_viewed_files, mark_file_as_viewed_async, unmark_file_as_viewed_async, DiffOptions, PrInfo,
+    fetch_viewed_files, format_timing, mark_file_as_viewed_async, step_timing,
+    unmark_file_as_viewed_async, DiffOptions, PrInfo,
 };
 use spinoff::{spinners, Color, Spinner};
 
@@ -230,6 +231,8 @@ pub fn run_app_with_pr(
     pr_info: PrInfo,
     backend: &dyn VcsBackend,
 ) -> io::Result<()> {
+    let timings = options.timings_start.is_some();
+    let step_start = Instant::now();
     let mut spinner = Spinner::new(
         spinners::Dots,
         format!(
@@ -240,7 +243,11 @@ pub fn run_app_with_pr(
     );
     match load_pr_file_diffs(&pr_info) {
         Ok(file_diffs) => {
-            spinner.success(&format!("Fetched {} files", file_diffs.len()));
+            spinner.success(&format!(
+                "Fetched {} files{}",
+                file_diffs.len(),
+                step_timing(timings, step_start)
+            ));
             run_app_internal(options, Some(pr_info), file_diffs, None, backend)
         }
         Err(e) => {
@@ -316,6 +323,7 @@ fn run_app_internal(
 
     // Load viewed files from GitHub on startup in PR mode (before TUI starts)
     if let Some(ref pr) = pr_info {
+        let step_start = Instant::now();
         let mut spinner = Spinner::new(
             spinners::Dots,
             format!("Syncing viewed status for {} files", state.file_diffs.len()),
@@ -323,7 +331,16 @@ fn run_app_internal(
         );
         sync_viewed_files_from_github(pr, &mut state);
         let viewed_count = state.viewed_files.len();
-        spinner.success(&format!("{} files marked as viewed", viewed_count));
+        spinner.success(&format!(
+            "{} files marked as viewed{}",
+            viewed_count,
+            step_timing(options.timings_start.is_some(), step_start)
+        ));
+    }
+
+    // Report total setup time before handing off to the interactive TUI.
+    if let Some(start) = options.timings_start {
+        println!("  total: {}", format_timing(start.elapsed()));
     }
 
     // Now enter TUI mode
