@@ -32,6 +32,8 @@ pub struct DiffOptions {
     pub stacked: bool,
     pub focus: Option<String>,
     pub origin: Option<String>,
+    /// [EXPERIMENTAL] Fetch PR file contents in parallel.
+    pub parallel: bool,
 }
 
 #[derive(Clone)]
