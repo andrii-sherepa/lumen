@@ -139,6 +139,10 @@ pub enum Commands {
         /// Origin repository in owner/repo format (default: origin git remote)
         #[arg(long)]
         origin: Option<String>,
+
+        /// [EXPERIMENTAL] Fetch PR file contents in parallel (faster for PRs with many files)
+        #[arg(long)]
+        parallel: bool,
     },
     /// Interactively configure Lumen (provider, API key)
     Configure,
@@ -164,5 +168,23 @@ mod tests {
     fn test_vcs_not_specified() {
         let cli = Cli::try_parse_from(["lumen", "diff"]).unwrap();
         assert_eq!(cli.vcs, None);
+    }
+
+    #[test]
+    fn test_diff_parallel_flag_parses() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "--parallel"]).unwrap();
+        match cli.command {
+            Commands::Diff { parallel, .. } => assert!(parallel),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_parallel_defaults_false() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5"]).unwrap();
+        match cli.command {
+            Commands::Diff { parallel, .. } => assert!(!parallel),
+            _ => panic!("expected diff command"),
+        }
     }
 }

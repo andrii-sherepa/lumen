@@ -1,11 +1,18 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::types::{is_binary_content, FileDiff, FileStatus};
 use super::{DiffOptions, PrInfo};
 use crate::commit_reference::CommitReference;
 use crate::vcs::VcsBackend;
+
+/// Upper bound on concurrent `gh` content fetches. Keeps process spawning and
+/// GitHub API pressure in check (avoids tripping secondary rate limits) while
+/// still collapsing the per-file round-trips that dominate PR load time.
+const MAX_CONCURRENT_FETCHES: usize = 12;
 
 pub fn get_current_branch(backend: &dyn VcsBackend) -> String {
     backend
@@ -157,7 +164,7 @@ pub fn load_file_diffs(options: &DiffOptions, backend: &dyn VcsBackend) -> Vec<F
         .collect()
 }
 
-pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
+pub fn load_pr_file_diffs(pr_info: &PrInfo, parallel: bool) -> Result<Vec<FileDiff>, String> {
     let repo_arg = format!("{}/{}", pr_info.repo_owner, pr_info.repo_name);
 
     // Get PR diff to find changed files
@@ -188,13 +195,142 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
         .map(|owner| format!("{}/{}", owner, pr_info.repo_name))
         .unwrap_or_else(|| base_repo.clone());
 
-    let file_diffs: Vec<FileDiff> = changed_files
+    // Parallel fetching is experimental and opt-in (`--parallel`); the default path
+    // fetches sequentially. Both share the same per-file fetch + error handling.
+    let file_diffs = if parallel {
+        build_file_diffs_parallel(
+            changed_files,
+            &base_repo,
+            &head_repo,
+            &pr_info.base_ref,
+            &pr_info.head_ref,
+            fetch_file_content_from_github,
+        )?
+    } else {
+        build_file_diffs_sequential(
+            changed_files,
+            &base_repo,
+            &head_repo,
+            &pr_info.base_ref,
+            &pr_info.head_ref,
+            fetch_file_content_from_github,
+        )?
+    };
+
+    Ok(file_diffs)
+}
+
+/// Build a `FileDiff` for every changed file, fetching old/new content via the
+/// injected `fetch` closure. Fetches run concurrently (bounded) since each file's
+/// content is independent; output order matches `changed_files`.
+fn build_file_diffs_parallel<F>(
+    changed_files: Vec<String>,
+    base_repo: &str,
+    head_repo: &str,
+    base_ref: &str,
+    head_ref: &str,
+    fetch: F,
+) -> Result<Vec<FileDiff>, String>
+where
+    F: Fn(&str, &str, &str) -> Result<String, String> + Sync,
+{
+    let n = changed_files.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Each file is an independent unit of work; results are written into a
+    // pre-sized slot array so output order matches the input regardless of which
+    // worker finishes first. The first fetch failure aborts remaining work so we
+    // don't keep hammering a rate-limited API, and is surfaced to the caller.
+    let next = AtomicUsize::new(0);
+    let aborted = AtomicBool::new(false);
+    let first_error: Mutex<Option<String>> = Mutex::new(None);
+    let results: Vec<Mutex<Option<FileDiff>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let workers = MAX_CONCURRENT_FETCHES.min(n);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if aborted.load(Ordering::Relaxed) {
+                    break;
+                }
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    break;
+                }
+                let filename = &changed_files[idx];
+
+                let contents = fetch(base_repo, base_ref, filename).and_then(|old| {
+                    fetch(head_repo, head_ref, filename).map(|new| (old, new))
+                });
+                let (old_content, new_content) = match contents {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let mut slot = first_error.lock().unwrap();
+                        if slot.is_none() {
+                            *slot = Some(e);
+                        }
+                        aborted.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                };
+
+                let status = if old_content.is_empty() && !new_content.is_empty() {
+                    FileStatus::Added
+                } else if !old_content.is_empty() && new_content.is_empty() {
+                    FileStatus::Deleted
+                } else {
+                    FileStatus::Modified
+                };
+                let is_binary =
+                    is_binary_content(&old_content) || is_binary_content(&new_content);
+
+                *results[idx].lock().unwrap() = Some(FileDiff {
+                    filename: filename.clone(),
+                    old_content,
+                    new_content,
+                    status,
+                    is_binary,
+                });
+            });
+        }
+    });
+
+    if let Some(e) = first_error.into_inner().unwrap() {
+        return Err(e);
+    }
+
+    Ok(results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap()
+                .expect("every file slot is filled when no error occurred")
+        })
+        .collect())
+}
+
+/// Build a `FileDiff` for every changed file by fetching old/new content one file
+/// at a time via the injected `fetch` closure (the default, non-experimental path).
+/// Output order matches `changed_files`; the first fetch failure is surfaced and
+/// stops further fetching.
+fn build_file_diffs_sequential<F>(
+    changed_files: Vec<String>,
+    base_repo: &str,
+    head_repo: &str,
+    base_ref: &str,
+    head_ref: &str,
+    fetch: F,
+) -> Result<Vec<FileDiff>, String>
+where
+    F: Fn(&str, &str, &str) -> Result<String, String>,
+{
+    changed_files
         .into_iter()
         .map(|filename| {
-            let old_content =
-                fetch_file_content_from_github(&base_repo, &pr_info.base_ref, &filename);
-            let new_content =
-                fetch_file_content_from_github(&head_repo, &pr_info.head_ref, &filename);
+            let old_content = fetch(base_repo, base_ref, &filename)?;
+            let new_content = fetch(head_repo, head_ref, &filename)?;
 
             let status = if old_content.is_empty() && !new_content.is_empty() {
                 FileStatus::Added
@@ -203,23 +339,56 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
             } else {
                 FileStatus::Modified
             };
+            let is_binary = is_binary_content(&old_content) || is_binary_content(&new_content);
 
-            let is_binary =
-                is_binary_content(&old_content) || is_binary_content(&new_content);
-            FileDiff {
+            Ok(FileDiff {
                 filename,
                 old_content,
                 new_content,
                 status,
                 is_binary,
-            }
+            })
         })
-        .collect();
-
-    Ok(file_diffs)
+        .collect()
 }
 
-fn fetch_file_content_from_github(repo: &str, git_ref: &str, path: &str) -> String {
+/// Interpret the result of a `gh api .../contents/...` invocation.
+///
+/// A 404 means the file is legitimately absent at that ref (an added file has no
+/// base version, a deleted file has no head version), so an empty side is correct.
+/// Any other failure (rate limit, network, auth) is a real error that is surfaced
+/// instead of being silently turned into empty content — which would otherwise
+/// misclassify the file (e.g. a rate-limited head fetch makes a Modified file look
+/// Deleted).
+fn interpret_content_response(
+    success: bool,
+    stdout: String,
+    stderr: &str,
+    path: &str,
+) -> Result<String, String> {
+    if success {
+        return Ok(stdout);
+    }
+    // 404: the file simply doesn't exist at this ref — an empty side is correct.
+    if stderr.contains("(HTTP 404)") {
+        return Ok(String::new());
+    }
+    let detail = stderr.trim();
+    if detail.to_lowercase().contains("rate limit") || detail.contains("(HTTP 429)") {
+        Err(format!(
+            "GitHub rate limit hit while fetching '{}': {}",
+            path, detail
+        ))
+    } else {
+        Err(format!("Failed to fetch '{}' from GitHub: {}", path, detail))
+    }
+}
+
+fn fetch_file_content_from_github(
+    repo: &str,
+    git_ref: &str,
+    path: &str,
+) -> Result<String, String> {
     let api_path = format!("repos/{}/contents/{}?ref={}", repo, path, git_ref);
     let output = Command::new("gh")
         .args([
@@ -228,12 +397,15 @@ fn fetch_file_content_from_github(repo: &str, git_ref: &str, path: &str) -> Stri
             "-H",
             "Accept: application/vnd.github.raw+json",
         ])
-        .output();
+        .output()
+        .map_err(|e| format!("Failed to run gh api for '{}': {}", path, e))?;
 
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => String::new(),
-    }
+    interpret_content_response(
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        &String::from_utf8_lossy(&output.stderr),
+        path,
+    )
 }
 
 fn parse_changed_files_from_diff(diff: &str) -> Vec<String> {
@@ -325,6 +497,203 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn test_interpret_content_response_success_returns_content() {
+        let r = interpret_content_response(true, "file body".to_string(), "", "src/main.rs");
+        assert_eq!(r.unwrap(), "file body");
+    }
+
+    #[test]
+    fn test_interpret_content_response_404_is_empty_not_error() {
+        // A missing file at a ref (the empty side of an added/deleted file) is expected.
+        let r = interpret_content_response(
+            false,
+            String::new(),
+            "gh: Not Found (HTTP 404)",
+            "new_file.rs",
+        );
+        assert_eq!(r.unwrap(), "");
+    }
+
+    #[test]
+    fn test_interpret_content_response_rate_limit_is_error() {
+        let stderr = "gh: You have exceeded a secondary rate limit. (HTTP 403)";
+        let err = interpret_content_response(false, String::new(), stderr, "src/main.rs")
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("rate limit"));
+        assert!(err.contains("src/main.rs"));
+    }
+
+    #[test]
+    fn test_interpret_content_response_other_error_propagates() {
+        let err = interpret_content_response(
+            false,
+            String::new(),
+            "gh: Something broke (HTTP 500)",
+            "src/main.rs",
+        )
+        .unwrap_err();
+        assert!(err.contains("src/main.rs"));
+        assert!(!err.to_lowercase().contains("rate limit"));
+    }
+
+    #[test]
+    fn test_build_file_diffs_sequential_preserves_order_and_classifies() {
+        let files = vec![
+            "added.rs".to_string(),
+            "deleted.rs".to_string(),
+            "modified.rs".to_string(),
+        ];
+        let fetch = |_repo: &str, git_ref: &str, path: &str| -> Result<String, String> {
+            Ok(match (git_ref, path) {
+                ("main", "added.rs") => String::new(),
+                ("feature", "added.rs") => "new".to_string(),
+                ("main", "deleted.rs") => "old".to_string(),
+                ("feature", "deleted.rs") => String::new(),
+                ("main", "modified.rs") => "old".to_string(),
+                ("feature", "modified.rs") => "new".to_string(),
+                _ => String::new(),
+            })
+        };
+
+        let diffs =
+            build_file_diffs_sequential(files, "base/repo", "head/repo", "main", "feature", fetch)
+                .expect("no fetch errors");
+
+        let names: Vec<&str> = diffs.iter().map(|d| d.filename.as_str()).collect();
+        assert_eq!(names, vec!["added.rs", "deleted.rs", "modified.rs"]);
+        assert_eq!(diffs[0].status, FileStatus::Added);
+        assert_eq!(diffs[1].status, FileStatus::Deleted);
+        assert_eq!(diffs[2].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_build_file_diffs_sequential_propagates_and_stops_on_error() {
+        let files: Vec<String> = (0..10).map(|i| format!("file{}.rs", i)).collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        // Fail on the very first file; later files must not be fetched.
+        let fetch = |_repo: &str, _git_ref: &str, path: &str| -> Result<String, String> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if path == "file0.rs" {
+                Err("GitHub rate limit hit".to_string())
+            } else {
+                Ok("content".to_string())
+            }
+        };
+
+        let result =
+            build_file_diffs_sequential(files, "base/repo", "head/repo", "main", "feature", fetch);
+
+        let err = result.err().expect("fetch error should propagate");
+        assert!(err.contains("rate limit"));
+        // Only the failing file's first fetch ran — no further files.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_preserves_order() {
+        // More files than worker threads, so order must survive concurrency.
+        let files: Vec<String> = (0..50).map(|i| format!("file{}.rs", i)).collect();
+        // Both sides non-empty -> always Modified, never dropped.
+        let fetch = |_repo: &str, git_ref: &str, path: &str| Ok(format!("{}:{}", git_ref, path));
+
+        let diffs =
+            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch)
+                .expect("no fetch errors");
+
+        assert_eq!(diffs.len(), 50);
+        for (i, diff) in diffs.iter().enumerate() {
+            assert_eq!(diff.filename, format!("file{}.rs", i));
+        }
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_classifies_status() {
+        let files = vec![
+            "added.rs".to_string(),
+            "deleted.rs".to_string(),
+            "modified.rs".to_string(),
+        ];
+        // base ref ("main") yields OLD content, head ref ("feature") yields NEW content.
+        let fetch = |_repo: &str, git_ref: &str, path: &str| -> Result<String, String> {
+            Ok(match (git_ref, path) {
+                ("main", "added.rs") => String::new(),
+                ("feature", "added.rs") => "new".to_string(),
+                ("main", "deleted.rs") => "old".to_string(),
+                ("feature", "deleted.rs") => String::new(),
+                ("main", "modified.rs") => "old".to_string(),
+                ("feature", "modified.rs") => "new".to_string(),
+                _ => String::new(),
+            })
+        };
+
+        let diffs =
+            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch)
+                .expect("no fetch errors");
+
+        assert_eq!(diffs.len(), 3);
+        assert_eq!(diffs[0].status, FileStatus::Added);
+        assert_eq!(diffs[1].status, FileStatus::Deleted);
+        assert_eq!(diffs[2].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_routes_repo_and_ref() {
+        // Old content must come from base repo+ref, new from head repo+ref (fork PRs).
+        let files = vec!["f.rs".to_string()];
+        let fetch = |repo: &str, git_ref: &str, _path: &str| Ok(format!("{}@{}", repo, git_ref));
+
+        let diffs =
+            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch)
+                .expect("no fetch errors");
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].old_content, "base/repo@main");
+        assert_eq!(diffs[0].new_content, "head/repo@feature");
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_propagates_fetch_error() {
+        // A real fetch failure (e.g. rate limit) must surface, not be swallowed
+        // into empty content that misclassifies the file.
+        let files = vec!["ok.rs".to_string(), "boom.rs".to_string()];
+        let fetch = |_repo: &str, _git_ref: &str, path: &str| -> Result<String, String> {
+            if path == "boom.rs" {
+                Err("GitHub rate limit hit while fetching 'boom.rs'".to_string())
+            } else {
+                Ok("content".to_string())
+            }
+        };
+
+        let result =
+            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch);
+
+        let err = result.err().expect("fetch error should propagate");
+        assert!(err.contains("rate limit"));
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_stops_early_after_error() {
+        // Once a fetch fails, remaining work should be abandoned rather than
+        // hammering a rate-limited API with the rest of the files.
+        let files: Vec<String> = (0..60).map(|i| format!("file{}.rs", i)).collect();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let fetch = |_repo: &str, _git_ref: &str, _path: &str| -> Result<String, String> {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err("rate limit".to_string())
+        };
+
+        let result =
+            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch);
+
+        assert!(result.is_err());
+        // With early abort, only the in-flight batch runs — far fewer than 60.
+        assert!(
+            calls.load(std::sync::atomic::Ordering::Relaxed) < 60,
+            "expected early abort, but all files were fetched"
+        );
+    }
+
+    #[test]
     fn test_load_file_diffs_working_tree_untracked_in_new_dir() {
         let _lock = crate::vcs::test_utils::cwd_lock()
             .lock()
@@ -358,6 +727,7 @@ mod tests {
             stacked: false,
             focus: None,
             origin: None,
+            parallel: false,
         };
 
         let diffs = load_file_diffs(&options, &backend);
@@ -428,6 +798,7 @@ mod tests {
             stacked: false,
             focus: None,
             origin: None,
+            parallel: false,
         };
 
         let diffs = load_file_diffs(&options, &backend);
