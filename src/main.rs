@@ -143,6 +143,7 @@ async fn run() -> Result<(), LumenError> {
                 focus,
                 origin,
                 parallel,
+                timings_start: command::diff::timings_enabled().then(std::time::Instant::now),
             };
             command::diff::run_diff_ui(options, backend.as_ref())?;
         }

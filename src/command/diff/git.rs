@@ -728,6 +728,7 @@ mod tests {
             focus: None,
             origin: None,
             parallel: false,
+            timings_start: None,
         };
 
         let diffs = load_file_diffs(&options, &backend);
@@ -799,6 +800,7 @@ mod tests {
             focus: None,
             origin: None,
             parallel: false,
+            timings_start: None,
         };
 
         let diffs = load_file_diffs(&options, &backend);
