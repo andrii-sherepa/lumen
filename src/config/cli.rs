@@ -141,7 +141,7 @@ pub enum Commands {
         origin: Option<String>,
 
         /// [EXPERIMENTAL] Fetch PR file contents in parallel (faster for PRs with many files)
-        #[arg(long)]
+        #[arg(long = "jobs", short = 'j')]
         parallel: bool,
     },
     /// Interactively configure Lumen (provider, API key)
@@ -171,8 +171,8 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_parallel_flag_parses() {
-        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "--parallel"]).unwrap();
+    fn test_diff_jobs_flag_parses() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "--jobs"]).unwrap();
         match cli.command {
             Commands::Diff { parallel, .. } => assert!(parallel),
             _ => panic!("expected diff command"),
@@ -180,7 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_parallel_defaults_false() {
+    fn test_diff_jobs_short_flag_parses() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "-j"]).unwrap();
+        match cli.command {
+            Commands::Diff { parallel, .. } => assert!(parallel),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_defaults_false() {
         let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5"]).unwrap();
         match cli.command {
             Commands::Diff { parallel, .. } => assert!(!parallel),

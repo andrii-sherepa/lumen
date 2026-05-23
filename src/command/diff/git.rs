@@ -195,7 +195,7 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo, parallel: bool) -> Result<Vec<FileDi
         .map(|owner| format!("{}/{}", owner, pr_info.repo_name))
         .unwrap_or_else(|| base_repo.clone());
 
-    // Parallel fetching is experimental and opt-in (`--parallel`); the default path
+    // Parallel fetching is experimental and opt-in (`--jobs`/`-j`); the default path
     // fetches sequentially. Both share the same per-file fetch + error handling.
     let file_diffs = if parallel {
         build_file_diffs_parallel(
