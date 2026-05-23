@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::io;
 use std::process::{self, Command};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use spinoff::{spinners, Color, Spinner};
 
@@ -32,6 +33,41 @@ pub struct DiffOptions {
     pub stacked: bool,
     pub focus: Option<String>,
     pub origin: Option<String>,
+    /// When `Some`, timing instrumentation is enabled and the instant marks the
+    /// start of the run (used to report per-step and total elapsed time).
+    pub timings_start: Option<Instant>,
+}
+
+/// Whether timing instrumentation is enabled via the `LUMEN_TIMINGS`
+/// environment variable.
+pub(crate) fn timings_enabled() -> bool {
+    std::env::var("LUMEN_TIMINGS")
+        .map(|v| timings_value_enabled(&v))
+        .unwrap_or(false)
+}
+
+/// Interpret a `LUMEN_TIMINGS` value as a boolean. Anything other than
+/// empty/`0`/`false`/`no`/`off` (case-insensitive, trimmed) enables timings.
+fn timings_value_enabled(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "no" | "off"
+    )
+}
+
+/// Format a duration as seconds with two decimals, e.g. `1.85s`.
+fn format_timing(d: Duration) -> String {
+    format!("{:.2}s", d.as_secs_f64())
+}
+
+/// Suffix appended to a spinner's success message showing that step's elapsed
+/// time, e.g. ` (1.85s)`. Empty when timings are disabled.
+pub(crate) fn step_timing(enabled: bool, start: Instant) -> String {
+    if enabled {
+        format!(" ({})", format_timing(start.elapsed()))
+    } else {
+        String::new()
+    }
 }
 
 #[derive(Clone)]
@@ -315,6 +351,8 @@ fn unmark_file_as_viewed_sync(node_id: &str, file_path: &str) -> Result<(), Stri
 }
 
 pub fn run_diff_ui(options: DiffOptions, backend: &dyn VcsBackend) -> io::Result<()> {
+    let timings = options.timings_start.is_some();
+
     // Handle PR mode
     if let Some(ref pr_input) = options.pr {
         let spinner_msg = match parse_pr_input(pr_input) {
@@ -326,10 +364,14 @@ pub fn run_diff_ui(options: DiffOptions, backend: &dyn VcsBackend) -> io::Result
             }
             None => "Fetching PR".to_string(),
         };
+        let step_start = Instant::now();
         let mut spinner = Spinner::new(spinners::Dots, spinner_msg, Color::Cyan);
         match fetch_pr_info(pr_input, options.origin.as_deref()) {
             Ok(pr_info) => {
-                spinner.success("Fetched PR metadata");
+                spinner.success(&format!(
+                    "Fetched PR metadata{}",
+                    step_timing(timings, step_start)
+                ));
                 return app::run_app_with_pr(options, pr_info, backend);
             }
             Err(e) => {
@@ -351,10 +393,14 @@ pub fn run_diff_ui(options: DiffOptions, backend: &dyn VcsBackend) -> io::Result
                 }
                 None => "Fetching PR".to_string(),
             };
+            let step_start = Instant::now();
             let mut spinner = Spinner::new(spinners::Dots, spinner_msg, Color::Cyan);
             match fetch_pr_info(input, options.origin.as_deref()) {
                 Ok(pr_info) => {
-                    spinner.success("Fetched PR metadata");
+                    spinner.success(&format!(
+                        "Fetched PR metadata{}",
+                        step_timing(timings, step_start)
+                    ));
                     return app::run_app_with_pr(options, pr_info, backend);
                 }
                 Err(e) => {
@@ -408,4 +454,61 @@ pub fn run_diff_ui(options: DiffOptions, backend: &dyn VcsBackend) -> io::Result
     }
 
     app::run_app(options, None, backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn truthy_values_enable_timings() {
+        for v in ["1", "true", "yes", "on", "anything"] {
+            assert!(timings_value_enabled(v), "expected {v:?} to enable timings");
+        }
+    }
+
+    #[test]
+    fn falsy_values_disable_timings() {
+        for v in ["", "0", "false", "no", "off"] {
+            assert!(
+                !timings_value_enabled(v),
+                "expected {v:?} to disable timings"
+            );
+        }
+    }
+
+    #[test]
+    fn falsy_values_are_case_insensitive_and_trimmed() {
+        for v in ["FALSE", "  no  ", "Off", " 0 "] {
+            assert!(
+                !timings_value_enabled(v),
+                "expected {v:?} to disable timings"
+            );
+        }
+    }
+
+    #[test]
+    fn format_timing_uses_two_decimal_seconds() {
+        assert_eq!(format_timing(Duration::from_millis(1850)), "1.85s");
+        assert_eq!(format_timing(Duration::from_millis(420)), "0.42s");
+        assert_eq!(format_timing(Duration::from_secs(0)), "0.00s");
+        assert_eq!(format_timing(Duration::from_secs(12)), "12.00s");
+    }
+
+    #[test]
+    fn step_timing_is_empty_when_disabled() {
+        let start = Instant::now();
+        assert_eq!(step_timing(false, start), "");
+    }
+
+    #[test]
+    fn step_timing_is_parenthesized_suffix_when_enabled() {
+        let start = Instant::now();
+        let suffix = step_timing(true, start);
+        assert!(
+            suffix.starts_with(" (") && suffix.ends_with("s)"),
+            "unexpected suffix: {suffix:?}"
+        );
+    }
 }

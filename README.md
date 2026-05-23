@@ -173,6 +173,20 @@ Annotated lines display a `▍` gutter indicator. Use `I` to view, edit, delete,
 - `ctrl+h/l`: Previous/next commit (stacked mode)
 - `?`: Show all keybindings
 
+#### Debugging Slow Runs
+
+Set `LUMEN_TIMINGS=1` to print how long each setup step takes before the viewer opens, plus the total time. Useful for diagnosing slow PR loads:
+
+```bash
+LUMEN_TIMINGS=1 lumen diff --pr 123
+# ✓ Fetched PR metadata (0.42s)
+# ✓ Fetched 8 files (1.85s)
+# ✓ 0 files marked as viewed (0.23s)
+#   total: 2.51s
+```
+
+Any value other than `0`/`false`/`no`/`off` enables it.
+
 ## AI Features 🔅
 
 Lumen also bundles optional AI helpers for commit messages, explanations, and natural-language git commands. These require configuring an AI provider — the diff viewer above does not.
