@@ -140,9 +140,17 @@ pub enum Commands {
         #[arg(long)]
         origin: Option<String>,
 
-        /// [EXPERIMENTAL] Fetch PR file contents in parallel (faster for PRs with many files)
-        #[arg(long = "jobs", short = 'j')]
-        parallel: bool,
+        /// [EXPERIMENTAL] Fetch PR file contents in parallel using N workers
+        /// (default 12, max 32). e.g. -j8 or --jobs=8. Faster for PRs with many
+        /// files.
+        #[arg(
+            long = "jobs",
+            short = 'j',
+            value_name = "N",
+            num_args = 0..=1,
+            default_missing_value = "12"
+        )]
+        jobs: Option<usize>,
     },
     /// Interactively configure Lumen (provider, API key)
     Configure,
@@ -171,28 +179,78 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_jobs_flag_parses() {
-        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "--jobs"]).unwrap();
-        match cli.command {
-            Commands::Diff { parallel, .. } => assert!(parallel),
-            _ => panic!("expected diff command"),
-        }
-    }
-
-    #[test]
-    fn test_diff_jobs_short_flag_parses() {
-        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "-j"]).unwrap();
-        match cli.command {
-            Commands::Diff { parallel, .. } => assert!(parallel),
-            _ => panic!("expected diff command"),
-        }
-    }
-
-    #[test]
-    fn test_diff_jobs_defaults_false() {
+    fn test_diff_jobs_absent_is_none() {
         let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5"]).unwrap();
         match cli.command {
-            Commands::Diff { parallel, .. } => assert!(!parallel),
+            Commands::Diff { jobs, .. } => assert_eq!(jobs, None),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_long_bare_uses_default() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "--jobs"]).unwrap();
+        match cli.command {
+            Commands::Diff { jobs, .. } => assert_eq!(jobs, Some(12)),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_long_with_value() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "--jobs=8"]).unwrap();
+        match cli.command {
+            Commands::Diff { jobs, .. } => assert_eq!(jobs, Some(8)),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_short_bare_uses_default() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "-j"]).unwrap();
+        match cli.command {
+            Commands::Diff { jobs, .. } => assert_eq!(jobs, Some(12)),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_short_attached_value() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "-j8"]).unwrap();
+        match cli.command {
+            Commands::Diff { jobs, .. } => assert_eq!(jobs, Some(8)),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_short_space_value() {
+        let cli = Cli::try_parse_from(["lumen", "diff", "--pr", "5", "-j", "8"]).unwrap();
+        match cli.command {
+            Commands::Diff { jobs, .. } => assert_eq!(jobs, Some(8)),
+            _ => panic!("expected diff command"),
+        }
+    }
+
+    #[test]
+    fn test_diff_jobs_rejects_non_numeric_value() {
+        // cargo/make style: `-j main` consumes `main` as the count, which is not a
+        // number, so parsing fails rather than silently misreading it.
+        let result = Cli::try_parse_from(["lumen", "diff", "-j", "main"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_diff_positional_reference_before_bare_jobs() {
+        // A positional reference placed before a bare `-j` is unaffected.
+        let cli = Cli::try_parse_from(["lumen", "diff", "main", "-j"]).unwrap();
+        match cli.command {
+            Commands::Diff {
+                jobs, reference, ..
+            } => {
+                assert_eq!(jobs, Some(12));
+                assert!(reference.is_some());
+            }
             _ => panic!("expected diff command"),
         }
     }

@@ -9,10 +9,22 @@ use super::{DiffOptions, PrInfo};
 use crate::commit_reference::CommitReference;
 use crate::vcs::VcsBackend;
 
-/// Upper bound on concurrent `gh` content fetches. Keeps process spawning and
-/// GitHub API pressure in check (avoids tripping secondary rate limits) while
-/// still collapsing the per-file round-trips that dominate PR load time.
-const MAX_CONCURRENT_FETCHES: usize = 12;
+/// Upper bound on `-j N` worker threads. Keeps process spawning and GitHub API
+/// pressure in check (avoids tripping secondary rate limits) while still
+/// collapsing the per-file round-trips that dominate PR load time. The default
+/// when `-j` is given without a value (12) lives in the clap flag definition.
+const MAX_WORKERS: usize = 32;
+
+/// Resolve a requested `-j N` worker count into the actual thread count, clamped
+/// to `[1, MAX_WORKERS]`. When clamping changes the value, also return a note so
+/// the adjustment can be surfaced to the user rather than applied silently.
+fn resolve_worker_count(requested: usize) -> (usize, Option<String>) {
+    let clamped = requested.clamp(1, MAX_WORKERS);
+    let note = (clamped != requested).then(|| {
+        format!("lumen: -j {requested} out of range, using {clamped} (max {MAX_WORKERS})")
+    });
+    (clamped, note)
+}
 
 pub fn get_current_branch(backend: &dyn VcsBackend) -> String {
     backend
@@ -164,7 +176,7 @@ pub fn load_file_diffs(options: &DiffOptions, backend: &dyn VcsBackend) -> Vec<F
         .collect()
 }
 
-pub fn load_pr_file_diffs(pr_info: &PrInfo, parallel: bool) -> Result<Vec<FileDiff>, String> {
+pub fn load_pr_file_diffs(pr_info: &PrInfo, jobs: Option<usize>) -> Result<Vec<FileDiff>, String> {
     let repo_arg = format!("{}/{}", pr_info.repo_owner, pr_info.repo_name);
 
     // Get PR diff to find changed files
@@ -195,40 +207,48 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo, parallel: bool) -> Result<Vec<FileDi
         .map(|owner| format!("{}/{}", owner, pr_info.repo_name))
         .unwrap_or_else(|| base_repo.clone());
 
-    // Parallel fetching is experimental and opt-in (`--jobs`/`-j`); the default path
-    // fetches sequentially. Both share the same per-file fetch logic.
-    let file_diffs = if parallel {
-        build_file_diffs_parallel(
+    // Parallel fetching is experimental and opt-in (`--jobs`/`-j N`); the default
+    // path fetches sequentially. Both share the same per-file fetch logic.
+    let file_diffs = match jobs {
+        Some(requested) => {
+            let (workers, note) = resolve_worker_count(requested);
+            if let Some(note) = note {
+                eprintln!("{note}");
+            }
+            build_file_diffs_parallel(
+                changed_files,
+                &base_repo,
+                &head_repo,
+                &pr_info.base_ref,
+                &pr_info.head_ref,
+                workers,
+                fetch_file_content_from_github,
+            )
+        }
+        None => build_file_diffs_sequential(
             changed_files,
             &base_repo,
             &head_repo,
             &pr_info.base_ref,
             &pr_info.head_ref,
             fetch_file_content_from_github,
-        )
-    } else {
-        build_file_diffs_sequential(
-            changed_files,
-            &base_repo,
-            &head_repo,
-            &pr_info.base_ref,
-            &pr_info.head_ref,
-            fetch_file_content_from_github,
-        )
+        ),
     };
 
     Ok(file_diffs)
 }
 
 /// Build a `FileDiff` for every changed file, fetching old/new content via the
-/// injected `fetch` closure. Fetches run concurrently (bounded) since each file's
-/// content is independent; output order matches `changed_files`.
+/// injected `fetch` closure. Fetches run concurrently across up to `workers`
+/// threads (each file's content is independent); output order matches
+/// `changed_files`.
 fn build_file_diffs_parallel<F>(
     changed_files: Vec<String>,
     base_repo: &str,
     head_repo: &str,
     base_ref: &str,
     head_ref: &str,
+    workers: usize,
     fetch: F,
 ) -> Vec<FileDiff>
 where
@@ -244,7 +264,7 @@ where
     // worker finishes first.
     let next = AtomicUsize::new(0);
     let results: Vec<Mutex<Option<FileDiff>>> = (0..n).map(|_| Mutex::new(None)).collect();
-    let workers = MAX_CONCURRENT_FETCHES.min(n);
+    let workers = workers.min(n);
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -466,8 +486,15 @@ mod tests {
         // Both sides non-empty -> always Modified, never dropped.
         let fetch = |_repo: &str, git_ref: &str, path: &str| format!("{}:{}", git_ref, path);
 
-        let diffs =
-            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch);
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            8,
+            fetch,
+        );
 
         assert_eq!(diffs.len(), 50);
         for (i, diff) in diffs.iter().enumerate() {
@@ -495,8 +522,15 @@ mod tests {
             }
         };
 
-        let diffs =
-            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch);
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            4,
+            fetch,
+        );
 
         assert_eq!(diffs.len(), 3);
         assert_eq!(diffs[0].status, FileStatus::Added);
@@ -510,12 +544,64 @@ mod tests {
         let files = vec!["f.rs".to_string()];
         let fetch = |repo: &str, git_ref: &str, _path: &str| format!("{}@{}", repo, git_ref);
 
-        let diffs =
-            build_file_diffs_parallel(files, "base/repo", "head/repo", "main", "feature", fetch);
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            1,
+            fetch,
+        );
 
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].old_content, "base/repo@main");
         assert_eq!(diffs[0].new_content, "head/repo@feature");
+    }
+
+    #[test]
+    fn test_resolve_worker_count_in_range_has_no_note() {
+        assert_eq!(resolve_worker_count(1), (1, None));
+        assert_eq!(resolve_worker_count(12), (12, None));
+        assert_eq!(resolve_worker_count(MAX_WORKERS), (MAX_WORKERS, None));
+    }
+
+    #[test]
+    fn test_resolve_worker_count_zero_floors_to_one_with_note() {
+        let (count, note) = resolve_worker_count(0);
+        assert_eq!(count, 1);
+        assert!(note.expect("a note when clamped").contains("using 1"));
+    }
+
+    #[test]
+    fn test_resolve_worker_count_above_max_clamps_with_note() {
+        let (count, note) = resolve_worker_count(1000);
+        assert_eq!(count, MAX_WORKERS);
+        assert!(note
+            .expect("a note when clamped")
+            .contains(&MAX_WORKERS.to_string()));
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_respects_worker_count() {
+        // A single worker still fetches every file, in order.
+        let files: Vec<String> = (0..20).map(|i| format!("file{}.rs", i)).collect();
+        let fetch = |_repo: &str, git_ref: &str, path: &str| format!("{}:{}", git_ref, path);
+
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            1,
+            fetch,
+        );
+
+        assert_eq!(diffs.len(), 20);
+        for (i, diff) in diffs.iter().enumerate() {
+            assert_eq!(diff.filename, format!("file{}.rs", i));
+        }
     }
 
     #[test]
@@ -552,7 +638,7 @@ mod tests {
             stacked: false,
             focus: None,
             origin: None,
-            parallel: false,
+            jobs: None,
         };
 
         let diffs = load_file_diffs(&options, &backend);
@@ -623,7 +709,7 @@ mod tests {
             stacked: false,
             focus: None,
             origin: None,
-            parallel: false,
+            jobs: None,
         };
 
         let diffs = load_file_diffs(&options, &backend);
