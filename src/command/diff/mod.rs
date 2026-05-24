@@ -33,8 +33,9 @@ pub struct DiffOptions {
     pub stacked: bool,
     pub focus: Option<String>,
     pub origin: Option<String>,
-    /// [EXPERIMENTAL] Fetch PR file contents in parallel.
-    pub parallel: bool,
+    /// [EXPERIMENTAL] Worker count for parallel PR file fetching (`-j N`).
+    /// `None` fetches sequentially (the default).
+    pub jobs: Option<usize>,
     /// When `Some`, timing instrumentation is enabled and the instant marks the
     /// start of the run (used to report per-step and total elapsed time).
     pub timings_start: Option<Instant>,

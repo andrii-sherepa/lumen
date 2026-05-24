@@ -131,7 +131,7 @@ async fn run() -> Result<(), LumenError> {
             stacked,
             focus,
             origin,
-            parallel,
+            jobs,
         } => {
             let options = command::diff::DiffOptions {
                 reference,
@@ -142,7 +142,7 @@ async fn run() -> Result<(), LumenError> {
                 stacked,
                 focus,
                 origin,
-                parallel,
+                jobs,
                 timings_start: command::diff::timings_enabled().then(std::time::Instant::now),
             };
             command::diff::run_diff_ui(options, backend.as_ref())?;
