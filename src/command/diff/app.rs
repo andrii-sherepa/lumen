@@ -15,7 +15,8 @@ use ratatui::prelude::*;
 
 use super::coordinates::{extract_selected_text, PanelLayout};
 use super::git::{
-    get_current_branch, load_file_diffs, load_pr_file_diffs, load_single_commit_diffs,
+    experimental_enabled, get_current_branch, load_file_diffs, load_pr_file_diffs,
+    load_single_commit_diffs,
 };
 use super::highlight;
 use super::render::{
@@ -238,7 +239,7 @@ pub fn run_app_with_pr(
         ),
         Color::Cyan,
     );
-    match load_pr_file_diffs(&pr_info, options.jobs) {
+    match load_pr_file_diffs(&pr_info, experimental_enabled()) {
         Ok(file_diffs) => {
             spinner.success(&format!("Fetched {} files", file_diffs.len()));
             run_app_internal(options, Some(pr_info), file_diffs, None, backend)
@@ -359,7 +360,7 @@ fn run_app_internal(
         if state.needs_reload {
             let file_diffs = if let Some(ref pr) = pr_info {
                 // In PR mode, reload from GitHub
-                match load_pr_file_diffs(pr, options.jobs) {
+                match load_pr_file_diffs(pr, experimental_enabled()) {
                     Ok(diffs) => diffs,
                     Err(e) => {
                         eprintln!("Warning: failed to reload PR diffs: {}", e);
