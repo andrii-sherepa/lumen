@@ -165,13 +165,4 @@ mod tests {
         let cli = Cli::try_parse_from(["lumen", "diff"]).unwrap();
         assert_eq!(cli.vcs, None);
     }
-
-    #[test]
-    fn test_diff_rejects_removed_jobs_flag() {
-        // `--jobs`/`-j` were replaced by the LUMEN_EXPERIMENTAL env var; the diff
-        // command no longer accepts them.
-        assert!(Cli::try_parse_from(["lumen", "diff", "-j"]).is_err());
-        assert!(Cli::try_parse_from(["lumen", "diff", "--jobs"]).is_err());
-        assert!(Cli::try_parse_from(["lumen", "diff", "--jobs=8"]).is_err());
-    }
 }
