@@ -1,11 +1,38 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::types::{is_binary_content, FileDiff, FileStatus};
 use super::{DiffOptions, PrInfo};
 use crate::commit_reference::CommitReference;
 use crate::vcs::VcsBackend;
+
+/// Worker threads used for experimental parallel PR file fetching. Bounded well
+/// under GitHub's 100-concurrent-request limit to avoid tripping secondary rate
+/// limits while still collapsing the per-file round-trips that dominate PR load
+/// time. Capped at the file count at the call site, so small PRs spawn fewer.
+const PARALLEL_WORKERS: usize = 8;
+
+/// The env var that gates experimental features. Currently only parallel PR file
+/// fetching (see [`load_pr_file_diffs`]).
+const EXPERIMENTAL_ENV: &str = "LUMEN_EXPERIMENTAL";
+
+/// Whether experimental features are enabled, read from [`EXPERIMENTAL_ENV`].
+pub fn experimental_enabled() -> bool {
+    experimental_from_env_value(std::env::var(EXPERIMENTAL_ENV).ok().as_deref())
+}
+
+/// Interpret an env var value as a boolean experimental toggle. `None` (unset)
+/// and explicit off-values are disabled; only `1`/`true`/`yes`/`on`
+/// (case-insensitive, surrounding whitespace ignored) enable it.
+fn experimental_from_env_value(val: Option<&str>) -> bool {
+    matches!(
+        val.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
 
 pub fn get_current_branch(backend: &dyn VcsBackend) -> String {
     backend
@@ -157,7 +184,7 @@ pub fn load_file_diffs(options: &DiffOptions, backend: &dyn VcsBackend) -> Vec<F
         .collect()
 }
 
-pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
+pub fn load_pr_file_diffs(pr_info: &PrInfo, experimental: bool) -> Result<Vec<FileDiff>, String> {
     let repo_arg = format!("{}/{}", pr_info.repo_owner, pr_info.repo_name);
 
     // Get PR diff to find changed files
@@ -188,13 +215,118 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
         .map(|owner| format!("{}/{}", owner, pr_info.repo_name))
         .unwrap_or_else(|| base_repo.clone());
 
-    let file_diffs: Vec<FileDiff> = changed_files
+    // Parallel fetching is experimental and opt-in (LUMEN_EXPERIMENTAL); the
+    // default path fetches sequentially. Both share the same per-file fetch logic.
+    let file_diffs = if experimental {
+        build_file_diffs_parallel(
+            changed_files,
+            &base_repo,
+            &head_repo,
+            &pr_info.base_ref,
+            &pr_info.head_ref,
+            PARALLEL_WORKERS,
+            fetch_file_content_from_github,
+        )
+    } else {
+        build_file_diffs_sequential(
+            changed_files,
+            &base_repo,
+            &head_repo,
+            &pr_info.base_ref,
+            &pr_info.head_ref,
+            fetch_file_content_from_github,
+        )
+    };
+
+    Ok(file_diffs)
+}
+
+/// Build a `FileDiff` for every changed file, fetching old/new content via the
+/// injected `fetch` closure. Fetches run concurrently across up to `workers`
+/// threads (each file's content is independent); output order matches
+/// `changed_files`.
+fn build_file_diffs_parallel<F>(
+    changed_files: Vec<String>,
+    base_repo: &str,
+    head_repo: &str,
+    base_ref: &str,
+    head_ref: &str,
+    workers: usize,
+    fetch: F,
+) -> Vec<FileDiff>
+where
+    F: Fn(&str, &str, &str) -> String + Sync,
+{
+    let n = changed_files.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Each file is an independent unit of work; results are written into a
+    // pre-sized slot array so output order matches the input regardless of which
+    // worker finishes first.
+    let next = AtomicUsize::new(0);
+    let results: Vec<Mutex<Option<FileDiff>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let workers = workers.min(n);
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                if idx >= n {
+                    break;
+                }
+                let filename = &changed_files[idx];
+
+                let old_content = fetch(base_repo, base_ref, filename);
+                let new_content = fetch(head_repo, head_ref, filename);
+
+                let status = if old_content.is_empty() && !new_content.is_empty() {
+                    FileStatus::Added
+                } else if !old_content.is_empty() && new_content.is_empty() {
+                    FileStatus::Deleted
+                } else {
+                    FileStatus::Modified
+                };
+                let is_binary =
+                    is_binary_content(&old_content) || is_binary_content(&new_content);
+
+                *results[idx].lock().unwrap() = Some(FileDiff {
+                    filename: filename.clone(),
+                    old_content,
+                    new_content,
+                    status,
+                    is_binary,
+                });
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap().expect("every file slot is filled"))
+        .collect()
+}
+
+/// Build a `FileDiff` for every changed file by fetching old/new content one file
+/// at a time via the injected `fetch` closure (the default, non-experimental path).
+/// Output order matches `changed_files`.
+fn build_file_diffs_sequential<F>(
+    changed_files: Vec<String>,
+    base_repo: &str,
+    head_repo: &str,
+    base_ref: &str,
+    head_ref: &str,
+    fetch: F,
+) -> Vec<FileDiff>
+where
+    F: Fn(&str, &str, &str) -> String,
+{
+    changed_files
         .into_iter()
         .map(|filename| {
-            let old_content =
-                fetch_file_content_from_github(&base_repo, &pr_info.base_ref, &filename);
-            let new_content =
-                fetch_file_content_from_github(&head_repo, &pr_info.head_ref, &filename);
+            let old_content = fetch(base_repo, base_ref, &filename);
+            let new_content = fetch(head_repo, head_ref, &filename);
 
             let status = if old_content.is_empty() && !new_content.is_empty() {
                 FileStatus::Added
@@ -203,9 +335,8 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
             } else {
                 FileStatus::Modified
             };
+            let is_binary = is_binary_content(&old_content) || is_binary_content(&new_content);
 
-            let is_binary =
-                is_binary_content(&old_content) || is_binary_content(&new_content);
             FileDiff {
                 filename,
                 old_content,
@@ -214,9 +345,7 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
                 is_binary,
             }
         })
-        .collect();
-
-    Ok(file_diffs)
+        .collect()
 }
 
 fn fetch_file_content_from_github(repo: &str, git_ref: &str, path: &str) -> String {
@@ -323,6 +452,158 @@ mod tests {
     use crate::vcs::test_utils::{git, make_temp_dir, RepoGuard};
     use crate::vcs::GitBackend;
     use std::fs;
+
+    #[test]
+    fn test_experimental_from_env_value_truthy() {
+        for v in ["1", "true", "TRUE", "yes", "on", " true "] {
+            assert!(
+                experimental_from_env_value(Some(v)),
+                "{v:?} should enable experimental mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_experimental_from_env_value_falsy_or_unset() {
+        assert!(!experimental_from_env_value(None));
+        for v in ["", "0", "false", "no", "off", "random"] {
+            assert!(
+                !experimental_from_env_value(Some(v)),
+                "{v:?} should not enable experimental mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_file_diffs_sequential_preserves_order_and_classifies() {
+        let files = vec![
+            "added.rs".to_string(),
+            "deleted.rs".to_string(),
+            "modified.rs".to_string(),
+        ];
+        let fetch = |_repo: &str, git_ref: &str, path: &str| -> String {
+            match (git_ref, path) {
+                ("main", "added.rs") => String::new(),
+                ("feature", "added.rs") => "new".to_string(),
+                ("main", "deleted.rs") => "old".to_string(),
+                ("feature", "deleted.rs") => String::new(),
+                ("main", "modified.rs") => "old".to_string(),
+                ("feature", "modified.rs") => "new".to_string(),
+                _ => String::new(),
+            }
+        };
+
+        let diffs =
+            build_file_diffs_sequential(files, "base/repo", "head/repo", "main", "feature", fetch);
+
+        let names: Vec<&str> = diffs.iter().map(|d| d.filename.as_str()).collect();
+        assert_eq!(names, vec!["added.rs", "deleted.rs", "modified.rs"]);
+        assert_eq!(diffs[0].status, FileStatus::Added);
+        assert_eq!(diffs[1].status, FileStatus::Deleted);
+        assert_eq!(diffs[2].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_preserves_order() {
+        // More files than worker threads, so order must survive concurrency.
+        let files: Vec<String> = (0..50).map(|i| format!("file{}.rs", i)).collect();
+        // Both sides non-empty -> always Modified, never dropped.
+        let fetch = |_repo: &str, git_ref: &str, path: &str| format!("{}:{}", git_ref, path);
+
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            8,
+            fetch,
+        );
+
+        assert_eq!(diffs.len(), 50);
+        for (i, diff) in diffs.iter().enumerate() {
+            assert_eq!(diff.filename, format!("file{}.rs", i));
+        }
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_classifies_status() {
+        let files = vec![
+            "added.rs".to_string(),
+            "deleted.rs".to_string(),
+            "modified.rs".to_string(),
+        ];
+        // base ref ("main") yields OLD content, head ref ("feature") yields NEW content.
+        let fetch = |_repo: &str, git_ref: &str, path: &str| -> String {
+            match (git_ref, path) {
+                ("main", "added.rs") => String::new(),
+                ("feature", "added.rs") => "new".to_string(),
+                ("main", "deleted.rs") => "old".to_string(),
+                ("feature", "deleted.rs") => String::new(),
+                ("main", "modified.rs") => "old".to_string(),
+                ("feature", "modified.rs") => "new".to_string(),
+                _ => String::new(),
+            }
+        };
+
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            4,
+            fetch,
+        );
+
+        assert_eq!(diffs.len(), 3);
+        assert_eq!(diffs[0].status, FileStatus::Added);
+        assert_eq!(diffs[1].status, FileStatus::Deleted);
+        assert_eq!(diffs[2].status, FileStatus::Modified);
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_routes_repo_and_ref() {
+        // Old content must come from base repo+ref, new from head repo+ref (fork PRs).
+        let files = vec!["f.rs".to_string()];
+        let fetch = |repo: &str, git_ref: &str, _path: &str| format!("{}@{}", repo, git_ref);
+
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            1,
+            fetch,
+        );
+
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].old_content, "base/repo@main");
+        assert_eq!(diffs[0].new_content, "head/repo@feature");
+    }
+
+    #[test]
+    fn test_build_file_diffs_parallel_respects_worker_count() {
+        // A single worker still fetches every file, in order.
+        let files: Vec<String> = (0..20).map(|i| format!("file{}.rs", i)).collect();
+        let fetch = |_repo: &str, git_ref: &str, path: &str| format!("{}:{}", git_ref, path);
+
+        let diffs = build_file_diffs_parallel(
+            files,
+            "base/repo",
+            "head/repo",
+            "main",
+            "feature",
+            1,
+            fetch,
+        );
+
+        assert_eq!(diffs.len(), 20);
+        for (i, diff) in diffs.iter().enumerate() {
+            assert_eq!(diff.filename, format!("file{}.rs", i));
+        }
+    }
 
     #[test]
     fn test_load_file_diffs_working_tree_untracked_in_new_dir() {
