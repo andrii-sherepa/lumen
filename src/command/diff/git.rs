@@ -9,21 +9,29 @@ use super::{DiffOptions, PrInfo};
 use crate::commit_reference::CommitReference;
 use crate::vcs::VcsBackend;
 
-/// Upper bound on `-j N` worker threads. Keeps process spawning and GitHub API
-/// pressure in check (avoids tripping secondary rate limits) while still
-/// collapsing the per-file round-trips that dominate PR load time. The default
-/// when `-j` is given without a value (12) lives in the clap flag definition.
-const MAX_WORKERS: usize = 32;
+/// Worker threads used for experimental parallel PR file fetching. Bounded well
+/// under GitHub's 100-concurrent-request limit to avoid tripping secondary rate
+/// limits while still collapsing the per-file round-trips that dominate PR load
+/// time. Capped at the file count at the call site, so small PRs spawn fewer.
+const PARALLEL_WORKERS: usize = 8;
 
-/// Resolve a requested `-j N` worker count into the actual thread count, clamped
-/// to `[1, MAX_WORKERS]`. When clamping changes the value, also return a note so
-/// the adjustment can be surfaced to the user rather than applied silently.
-fn resolve_worker_count(requested: usize) -> (usize, Option<String>) {
-    let clamped = requested.clamp(1, MAX_WORKERS);
-    let note = (clamped != requested).then(|| {
-        format!("lumen: -j {requested} out of range, using {clamped} (max {MAX_WORKERS})")
-    });
-    (clamped, note)
+/// The env var that gates experimental features. Currently only parallel PR file
+/// fetching (see [`load_pr_file_diffs`]).
+const EXPERIMENTAL_ENV: &str = "LUMEN_EXPERIMENTAL";
+
+/// Whether experimental features are enabled, read from [`EXPERIMENTAL_ENV`].
+pub fn experimental_enabled() -> bool {
+    experimental_from_env_value(std::env::var(EXPERIMENTAL_ENV).ok().as_deref())
+}
+
+/// Interpret an env var value as a boolean experimental toggle. `None` (unset)
+/// and explicit off-values are disabled; only `1`/`true`/`yes`/`on`
+/// (case-insensitive, surrounding whitespace ignored) enable it.
+fn experimental_from_env_value(val: Option<&str>) -> bool {
+    matches!(
+        val.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 pub fn get_current_branch(backend: &dyn VcsBackend) -> String {
@@ -176,7 +184,7 @@ pub fn load_file_diffs(options: &DiffOptions, backend: &dyn VcsBackend) -> Vec<F
         .collect()
 }
 
-pub fn load_pr_file_diffs(pr_info: &PrInfo, jobs: Option<usize>) -> Result<Vec<FileDiff>, String> {
+pub fn load_pr_file_diffs(pr_info: &PrInfo, experimental: bool) -> Result<Vec<FileDiff>, String> {
     let repo_arg = format!("{}/{}", pr_info.repo_owner, pr_info.repo_name);
 
     // Get PR diff to find changed files
@@ -207,32 +215,27 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo, jobs: Option<usize>) -> Result<Vec<F
         .map(|owner| format!("{}/{}", owner, pr_info.repo_name))
         .unwrap_or_else(|| base_repo.clone());
 
-    // Parallel fetching is experimental and opt-in (`--jobs`/`-j N`); the default
-    // path fetches sequentially. Both share the same per-file fetch logic.
-    let file_diffs = match jobs {
-        Some(requested) => {
-            let (workers, note) = resolve_worker_count(requested);
-            if let Some(note) = note {
-                eprintln!("{note}");
-            }
-            build_file_diffs_parallel(
-                changed_files,
-                &base_repo,
-                &head_repo,
-                &pr_info.base_ref,
-                &pr_info.head_ref,
-                workers,
-                fetch_file_content_from_github,
-            )
-        }
-        None => build_file_diffs_sequential(
+    // Parallel fetching is experimental and opt-in (LUMEN_EXPERIMENTAL); the
+    // default path fetches sequentially. Both share the same per-file fetch logic.
+    let file_diffs = if experimental {
+        build_file_diffs_parallel(
+            changed_files,
+            &base_repo,
+            &head_repo,
+            &pr_info.base_ref,
+            &pr_info.head_ref,
+            PARALLEL_WORKERS,
+            fetch_file_content_from_github,
+        )
+    } else {
+        build_file_diffs_sequential(
             changed_files,
             &base_repo,
             &head_repo,
             &pr_info.base_ref,
             &pr_info.head_ref,
             fetch_file_content_from_github,
-        ),
+        )
     };
 
     Ok(file_diffs)
@@ -451,6 +454,27 @@ mod tests {
     use std::fs;
 
     #[test]
+    fn test_experimental_from_env_value_truthy() {
+        for v in ["1", "true", "TRUE", "yes", "on", " true "] {
+            assert!(
+                experimental_from_env_value(Some(v)),
+                "{v:?} should enable experimental mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_experimental_from_env_value_falsy_or_unset() {
+        assert!(!experimental_from_env_value(None));
+        for v in ["", "0", "false", "no", "off", "random"] {
+            assert!(
+                !experimental_from_env_value(Some(v)),
+                "{v:?} should not enable experimental mode"
+            );
+        }
+    }
+
+    #[test]
     fn test_build_file_diffs_sequential_preserves_order_and_classifies() {
         let files = vec![
             "added.rs".to_string(),
@@ -560,29 +584,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_worker_count_in_range_has_no_note() {
-        assert_eq!(resolve_worker_count(1), (1, None));
-        assert_eq!(resolve_worker_count(12), (12, None));
-        assert_eq!(resolve_worker_count(MAX_WORKERS), (MAX_WORKERS, None));
-    }
-
-    #[test]
-    fn test_resolve_worker_count_zero_floors_to_one_with_note() {
-        let (count, note) = resolve_worker_count(0);
-        assert_eq!(count, 1);
-        assert!(note.expect("a note when clamped").contains("using 1"));
-    }
-
-    #[test]
-    fn test_resolve_worker_count_above_max_clamps_with_note() {
-        let (count, note) = resolve_worker_count(1000);
-        assert_eq!(count, MAX_WORKERS);
-        assert!(note
-            .expect("a note when clamped")
-            .contains(&MAX_WORKERS.to_string()));
-    }
-
-    #[test]
     fn test_build_file_diffs_parallel_respects_worker_count() {
         // A single worker still fetches every file, in order.
         let files: Vec<String> = (0..20).map(|i| format!("file{}.rs", i)).collect();
@@ -638,7 +639,6 @@ mod tests {
             stacked: false,
             focus: None,
             origin: None,
-            jobs: None,
             timings_start: None,
         };
 
@@ -710,7 +710,6 @@ mod tests {
             stacked: false,
             focus: None,
             origin: None,
-            jobs: None,
             timings_start: None,
         };
 
